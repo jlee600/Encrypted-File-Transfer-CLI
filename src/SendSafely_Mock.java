@@ -3,14 +3,14 @@ import com.sendsafely.Package;
 import com.sendsafely.Recipient;
 import com.sendsafely.SendSafely;
 import com.sendsafely.dto.PackageURL;
-import com.sendsafely.dto.UserInformation;
 import com.sendsafely.ProgressInterface;
+import com.sendsafely.File;
 import com.sendsafely.file.FileManager;
 import com.sendsafely.file.DefaultFileManager;
 import com.sendsafely.exceptions.*;
 
 // importing Java util
-import java.io.File;
+import java.io.IOException;
 import java.text.MessageFormat;
 import java.util.Scanner;
 import java.util.Stack;
@@ -34,13 +34,15 @@ public class SendSafely_Mock {
             System.out.println("Authentication failed: " + e.getMessage());
         } catch (CreatePackageFailedException e) {
             System.out.println("Package creation failed: " + e.getMessage());
+        } catch (LimitExceededException e) {
+            System.out.println("Package Limit Exceeded: " + e.getMessage());
         } catch (Exception e) {
-            System.out.println("Initialization error: " + e.getMessage());
+            System.out.println("Unexpected error during initiation: " + e.getMessage());
         }
     }
 
     // Authenticate user with SendSafely API credentials.
-    private static void authenticate() throws Exception {
+    private static void authenticate() throws InvalidCredentialsException {
         System.out.print("Enter your SendSafely API Key: ");
         String apiKey = scanner.nextLine().trim();
         System.out.print("Enter your SendSafely API Secret: ");
@@ -50,9 +52,8 @@ public class SendSafely_Mock {
         client = new SendSafely("https://app.sendsafely.com", apiKey, apiSecret);
 
         // Retrieve user information from the API
-        UserInformation userInformation = client.getUserInformation();
-        System.out.println("\nHello " + userInformation.getFirstName() + "!");
-        System.out.println("Successfully connected to SendSafely as " + userInformation.getEmail());
+        String userEmail = client.verifyCredentials();
+        System.out.println("Successfully connected to SendSafely as " +userEmail);
     }
 
     /**
@@ -98,22 +99,18 @@ public class SendSafely_Mock {
     private static void handleUpload() {
         System.out.print("Enter file path: ");
         String filePath = scanner.nextLine().trim();
-        File file = new File(filePath);
-
-        if (!file.exists() || !file.isFile()) {
-            System.out.println("Error: File does not exist or is not a valid file.");
-            return;
-        }
-
         try {
-            System.out.println("Uploading file: " + file.getName());
-            Progress progressCallback = new Progress(file.getName());
+            System.out.println("Uploading file");
             FileManager fileManager = new DefaultFileManager(new java.io.File(filePath));
-            com.sendsafely.File addedFile = client.encryptAndUploadFile(pkgInfo.getPackageId(), pkgInfo.getKeyCode(), fileManager, progressCallback);
+            File addedFile = client.encryptAndUploadFile(pkgInfo.getPackageId(), pkgInfo.getKeyCode(), fileManager, new Progress(filePath));
             System.out.println("File uploaded with ID: " + addedFile.getFileId());
-            undoStack.push(new UploadFileCommand(pkgInfo.getPackageId(), addedFile.getFileId(), client));
+            undoStack.push(new UploadFileCommand(pkgInfo.getPackageId(), pkgInfo.getRootDirectoryId(), addedFile.getFileId(), client));
+        } catch (IOException e) {
+            System.out.println("IO Exception: " + e.getMessage());
         } catch (UploadFileException e) {
             System.out.println("File upload failed: " + e.getMessage());
+        } catch (LimitExceededException e) {
+            System.out.println("File Limit Exceeded: " + e.getMessage());
         } catch (Exception e) {
             System.out.println("Unexpected error during file upload: " + e.getMessage());
         }
@@ -133,6 +130,8 @@ public class SendSafely_Mock {
             Recipient newRecipient = client.addRecipient(pkgInfo.getPackageId(), email);
             System.out.println("Recipient added - ID#: " + newRecipient.getRecipientId());
             undoStack.push(new AddRecipientCommand(pkgInfo.getPackageId(), newRecipient.getRecipientId(), client));
+        } catch (LimitExceededException e) {
+            System.out.println("Recipient Limit Exceeded: " + e.getMessage());
         } catch (RecipientFailedException e) {
             System.out.println("Failed to add recipient: " + e.getMessage());
         } catch (Exception e) {
@@ -145,8 +144,12 @@ public class SendSafely_Mock {
         try {
             PackageURL secureLink = client.finalizePackage(pkgInfo.getPackageId(), pkgInfo.getKeyCode());
             System.out.println("Package was finalized. The package can be downloaded from the following URL: " + secureLink.getSecureLink());
+        } catch (LimitExceededException e) {
+            System.out.println("Package Limit Exceeded: " + e.getMessage());
         } catch (FinalizePackageFailedException e) {
             System.out.println("Finalization failed: " + e.getMessage());
+        } catch (ApproverRequiredException e) {
+            System.out.println("Approve Required: " + e.getMessage());
         } catch (Exception e) {
             System.out.println("Unexpected error during finalization: " + e.getMessage());
         }
@@ -162,8 +165,6 @@ public class SendSafely_Mock {
         try {
             lastAction.undo();
             System.out.println("Undo successful.");
-        } catch (SendFailedException e) {
-            System.out.println("Undo failed (SendSafely error): " + e.getMessage());
         } catch (Exception e) {
             System.out.println("Undo failed: " + e.getMessage());
         }
@@ -172,25 +173,33 @@ public class SendSafely_Mock {
 
 // Command interface for undoable actions.
 interface Command {
-    void undo() throws Exception;
+    void undo() throws DeletePackageException, RecipientFailedException;
 }
 
 // Undo command for file uploads.
 class UploadFileCommand implements Command {
     private final String packageId;
+    private final String directoryId;
     private final String fileId;
     private final SendSafely client;
 
-    public UploadFileCommand(String packageId, String fileId, SendSafely client) {
+    public UploadFileCommand(String packageId, String directoryId, String fileId, SendSafely client) {
         this.packageId = packageId;
+        this.directoryId = directoryId;
         this.fileId = fileId;
         this.client = client;
     }
 
     @Override
-    public void undo() throws Exception {
-        client.deleteTempPackage(packageId);
-        System.out.println("File with ID " + fileId + " removed from package.");
+    public void undo() {
+        try {
+            client.deleteFile(packageId, directoryId, fileId);
+            System.out.println("File with ID " + fileId + " removed from package.");
+        } catch (FileOperationFailedException e) {
+            System.out.println("Cannot Undo upload: " + e.getMessage());
+        } catch (Exception e) {
+            System.out.println("Unexpected error during upload undo: " + e.getMessage());
+        }
     }
 }
 
@@ -207,12 +216,14 @@ class AddRecipientCommand implements Command {
     }
 
     @Override
-    public void undo() throws Exception {
+    public void undo() {
         try {
             client.removeRecipient(packageId, recipientId);
             System.out.println("Recipient " + recipientId + " removed from package.");
         } catch (RecipientFailedException e) {
-            throw new Exception("Could not undo add recipient: " + e.getMessage());
+            System.out.println("Could not undo add recipient: " + e.getMessage());
+        } catch (Exception e) {
+            System.out.println("Unexpected error during add recipient undo: " + e.getMessage());
         }
     }
 }
@@ -227,7 +238,7 @@ class Progress implements ProgressInterface {
 
     @Override
     public void updateProgress(String fileId, double progress) {
-        System.out.println(MessageFormat.format("Uploading {0}: {1,number,#.##%}", fileName, progress));
+        System.out.println(MessageFormat.format("Uploading: {0,number,#.##%}", progress));
     }
 
     @Override
